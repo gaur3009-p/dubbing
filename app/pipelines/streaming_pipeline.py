@@ -1,34 +1,70 @@
 """
-streaming_pipeline.py
-=====================
-Fixes vs original
-─────────────────
-1. GAP IN DUB — root cause: only `last_translated` was sent to TTS.
-   If 3 chunks drained at once, chunks 1 and 2 were silently dropped.
-   Fix: every chunk that has translated text gets its own TTS job queued
-   into a dedicated TTS thread pool.  Audio files are played back in order.
+streaming_pipeline.py  —  Word-Accumulator Streaming Dub
+=========================================================
 
-2. TRANSLATION INACCURACY — NLLB translated each chunk with zero context,
-   so mid-sentence fragments ("He was called dead he said.") came out broken.
-   Fix: a sliding context window of the last 2 committed sentences is
-   prepended to each chunk before translation.  NLLB uses this as prior
-   context and produces coherent continuations.
+Architecture (completely rewritten)
+────────────────────────────────────
 
-3. LATENCY — TTS still ran on the Gradio callback thread in the version
-   before this one.  Here ASR+Translate+TTS all run inside worker threads.
-   The Gradio thread only picks up finished audio files.
+OLD approach (broken):
+  mic → VAD chunk (500 ms silence) → ASR → translate → TTS
+  Problem: nothing starts until the speaker pauses.
+  One long sentence = one 2-3s stall. Parallel worker didn't help
+  because ASR itself takes ~300ms and all steps were still serial
+  per chunk.
 
-4. VOICE CLONING — speak_as() is used instead of speak(), routing through
-   CosyVoice zero-shot if enrolled, else Parler-TTS fallback.
+NEW approach — Word-Accumulator Pipeline:
+  ┌─────────────────────────────────────────────────────────────┐
+  │  Gradio audio frame (every ~100ms)                          │
+  │       ↓                                                     │
+  │  Rolling 2-second audio window → Whisper (tiny, beam=1)    │
+  │       ↓  incremental words appear                          │
+  │  Word buffer — accumulate until COMMIT trigger:             │
+  │    • ≥ 3 new words  AND  200ms silence  → COMMIT            │
+  │    • ≥ 8 words (no silence yet)         → FORCE COMMIT      │
+  │       ↓                                                     │
+  │  Committed text → translate (NLLB, with context window)    │
+  │       ↓                 ↑ fires in thread, non-blocking    │
+  │  Translated text → TTS (Parler/CosyVoice)                  │
+  │       ↓                 ↑ fires in thread, non-blocking    │
+  │  speech_file → Gradio audio widget                         │
+  └─────────────────────────────────────────────────────────────┘
+
+Key design decisions
+────────────────────
+1. WHISPER runs on a 2s rolling window every frame (~100ms cadence).
+   We diff the new transcript against the last one to extract *only
+   new words* — no repeated translation of old words.
+
+2. COMMIT is word-count + silence based, not VAD-chunk based.
+   3 new confirmed words + 200ms quiet = commit immediately.
+   This means "I don't know" fires translate+TTS in ~400ms from
+   when the words were spoken, not after a 500ms silence gap.
+
+3. TRANSLATE + TTS run in a single background thread per commit,
+   submitted to a ThreadPoolExecutor. The Gradio thread never blocks
+   on inference — it only queues jobs and drains finished ones.
+
+4. ORDERED PLAYBACK: finished jobs are returned in submission order.
+   A slow job does NOT block faster ones behind it (drain_ready logic).
+
+5. CONTEXT WINDOW: last 2 committed translations are prepended to each
+   new NLLB call so the model knows it's a continuation, not an
+   isolated fragment.
+
+6. VOICE CLONING: speak_as() is used — CosyVoice if enrolled,
+   Parler-TTS fallback. Enrollment happens silently from the first
+   3s of speech.
 """
 
 import time
 import threading
 import numpy as np
+import tempfile
+import soundfile as sf
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, Future
 
-from realtime.chunker import VoiceChunker
-from realtime.parallel_worker import ParallelChunkProcessor
+# ── Services ──────────────────────────────────────────────────────────────────
 from services.asr import transcribe
 from services.translator import translate
 from services.tts_cloning import speak_as
@@ -55,225 +91,287 @@ LANGUAGES = {
     "Sanskrit":  "san_Deva",
 }
 
+# ── Constants ─────────────────────────────────────────────────────────────────
+SR              = 16000
+WINDOW_SECS     = 2.0          # rolling ASR window size
+FRAME_HOP       = 0.10         # run ASR every 100ms
+COMMIT_WORDS    = 3            # min new words to trigger commit
+FORCE_WORDS     = 8            # force commit even without silence
+SILENCE_COMMIT  = 0.20         # seconds of silence after ≥COMMIT_WORDS words
+SILENCE_SAMPLES = int(SILENCE_COMMIT * SR)
+ENROLL_SECS     = 3
+SPEAKER_ID      = "stream_user"
+
+# ── Thread pool (translate+TTS jobs) ─────────────────────────────────────────
+_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="dub_worker")
+
 # ── Session state ─────────────────────────────────────────────────────────────
-_chunker        = VoiceChunker(silence_trigger_ms=400, min_speech_ms=250, max_chunk_ms=6000)
+_audio_buf:     np.ndarray       = np.array([], dtype=np.float32)
+_last_transcript: str            = ""        # full transcript from last ASR run
+_committed_words: int            = 0         # how many words we've already committed
+_word_buf:      list[str]        = []        # new words not yet committed
+_silence_count: int              = 0         # frames of silence seen
 _fmt            = TranscriptFormatter()
-_current_target = "Hindi"
-_last_target    = "Hindi"
-_speaker_id     = "stream_user"
-
-# Sliding context: last N committed translated sentences for NLLB priming
-_context_window: deque[str] = deque(maxlen=2)
+_context_window: deque[str]      = deque(maxlen=2)
 _context_lock   = threading.Lock()
+_enroll_buf:    list[np.ndarray] = []
+_enroll_lock    = threading.Lock()
+_target_lang    = "Hindi"
 
-# Enrollment buffer
-_enroll_buf:  list[np.ndarray] = []
-_enroll_lock  = threading.Lock()
-_ENROLL_SECS  = 3
-
-# TTS result queue (seq → speech_file), kept in order for playback
-_tts_results: deque[tuple[int, str]] = deque()
-_tts_seq      = 0
-_tts_lock     = threading.Lock()
+# Job queue: (seq, Future[dict])
+_job_queue: deque[tuple[int, Future]] = deque()
+_job_seq:   int = 0
+_queue_lock = threading.Lock()
 
 
-# ── Context helpers ───────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _to_float32(data: np.ndarray) -> np.ndarray:
+    if data.dtype == np.int16:
+        return data.astype(np.float32) / 32768.0
+    if np.issubdtype(data.dtype, np.integer):
+        return data.astype(np.float32) / float(np.iinfo(data.dtype).max)
+    return data.astype(np.float32)
+
+
+def _resample(data: np.ndarray, sr: int) -> np.ndarray:
+    if sr == SR:
+        return data
+    import librosa
+    return librosa.resample(data, orig_sr=sr, target_sr=SR)
+
+
+def _is_silent(chunk: np.ndarray, threshold: float = 0.01) -> bool:
+    """Energy-based silence check — fast, no VAD model needed."""
+    return float(np.sqrt(np.mean(chunk ** 2))) < threshold
+
 
 def _get_context() -> str:
     with _context_lock:
         return " ".join(_context_window).strip()
 
 
-def _push_context(translated: str) -> None:
+def _push_context(text: str) -> None:
     with _context_lock:
-        _context_window.append(translated.strip())
+        _context_window.append(text.strip())
 
-
-# ── Worker function ───────────────────────────────────────────────────────────
-
-def _make_process_fn(target_lang: str, speaker_id: str):
-    """
-    Closure capturing target_lang and speaker_id at push-time so workers
-    never race on the global _current_target.
-    """
-    tgt_code = LANGUAGES.get(target_lang, "hin_Deva")
-
-    def _process(wav_path: str) -> dict:
-        t0 = time.perf_counter()
-
-        # ASR
-        text, src_lang = transcribe(wav_path)
-        asr_ms = round((time.perf_counter() - t0) * 1000, 1)
-
-        if not text.strip():
-            return {
-                "text": "", "translated": "", "speech_file": None,
-                "asr_ms": asr_ms, "tr_ms": 0.0, "tts_ms": 0.0,
-            }
-
-        # Translate WITH sliding context so NLLB sees prior sentences
-        ctx = _get_context()
-        text_for_nllb = (ctx + " " + text.strip()).strip() if ctx else text.strip()
-
-        t_tr = time.perf_counter()
-        translated_full = translate(text_for_nllb, src_lang, tgt_code)
-        tr_ms = round((time.perf_counter() - t_tr) * 1000, 1)
-
-        # Strip the context portion back out from the translation.
-        # NLLB translates left-to-right; the new content is at the end.
-        # We keep only the portion corresponding to the current chunk by
-        # splitting on the last context sentence's translation.
-        translated = translated_full.strip()
-        if ctx:
-            # Find where the new content starts after the context translation
-            ctx_translated = translate(ctx, src_lang, tgt_code).strip()
-            if ctx_translated and translated.startswith(ctx_translated):
-                translated = translated[len(ctx_translated):].strip(" ,.।")
-            # If stripping fails (NLLB paraphrased context), just use full output
-            if not translated:
-                translated = translated_full.strip()
-
-        # Update rolling context with this chunk's translation
-        _push_context(translated)
-
-        # TTS — zero-shot clone if enrolled, else Parler fallback
-        t_tts = time.perf_counter()
-        speech_file = speak_as(translated, speaker_id)
-        tts_ms = round((time.perf_counter() - t_tts) * 1000, 1)
-
-        return {
-            "text":        text.strip(),
-            "translated":  translated,
-            "speech_file": speech_file,
-            "src_lang":    src_lang,
-            "asr_ms":      asr_ms,
-            "tr_ms":       tr_ms,
-            "tts_ms":      tts_ms,
-        }
-
-    return _process
-
-
-# ── Processor (re-created on language change) ─────────────────────────────────
-_processor = ParallelChunkProcessor(
-    process_fn=_make_process_fn(_current_target, _speaker_id),
-    max_in_flight=6,
-)
-
-
-# ── Enrollment ────────────────────────────────────────────────────────────────
 
 def _try_enroll(chunk: np.ndarray) -> None:
-    if is_enrolled(_speaker_id):
+    if is_enrolled(SPEAKER_ID):
         return
     with _enroll_lock:
-        _enroll_buf.append(chunk)
+        _enroll_buf.append(chunk.copy())
         total = sum(len(a) for a in _enroll_buf)
-        if total >= 16000 * _ENROLL_SECS:
+        if total >= SR * ENROLL_SECS:
             combined = np.concatenate(_enroll_buf)
-            enroll_speaker(_speaker_id, combined, sr=16000)
+            enroll_speaker(SPEAKER_ID, combined, sr=SR)
             _enroll_buf.clear()
-            print(f"[streaming_pipeline] enrolled '{_speaker_id}' "
-                  f"({total/16000:.1f}s) — zero-shot cloning active")
+            print(f"[stream] enrolled '{SPEAKER_ID}' ({total/SR:.1f}s) — cloning active")
+
+
+# ── Background worker: translate + TTS ───────────────────────────────────────
+
+def _translate_and_speak(text: str, tgt_lang: str, speaker_id: str) -> dict:
+    """Runs in thread pool. Returns speech_file path and timings."""
+    tgt_code = LANGUAGES.get(tgt_lang, "hin_Deva")
+
+    # Translate with sliding context so NLLB sees prior sentences
+    ctx = _get_context()
+    text_with_ctx = (ctx + " " + text).strip() if ctx else text
+
+    t_tr = time.perf_counter()
+    translated_full = translate(text_with_ctx, "eng_Latn", tgt_code)
+    tr_ms = round((time.perf_counter() - t_tr) * 1000, 1)
+
+    # Strip context portion back out
+    translated = translated_full.strip()
+    if ctx:
+        ctx_tr = translate(ctx, "eng_Latn", tgt_code).strip()
+        if ctx_tr and translated.startswith(ctx_tr):
+            translated = translated[len(ctx_tr):].lstrip(" ,।.")
+        if not translated:
+            translated = translated_full.strip()
+
+    _push_context(translated)
+
+    # TTS
+    t_tts = time.perf_counter()
+    speech_file = speak_as(translated, speaker_id)
+    tts_ms = round((time.perf_counter() - t_tts) * 1000, 1)
+
+    return {
+        "text":        text,
+        "translated":  translated,
+        "speech_file": speech_file,
+        "tr_ms":       tr_ms,
+        "tts_ms":      tts_ms,
+    }
+
+
+def _submit_job(text: str, tgt_lang: str) -> None:
+    """Submit a translate+TTS job to the thread pool."""
+    global _job_seq
+    future = _POOL.submit(_translate_and_speak, text, tgt_lang, SPEAKER_ID)
+    with _queue_lock:
+        _job_queue.append((_job_seq, future))
+        _job_seq += 1
+
+
+def _drain_jobs() -> list[dict]:
+    """
+    Return all completed jobs in submission order, skipping still-running ones.
+    A slow job does NOT block faster ones behind it.
+    """
+    done    = []
+    pending = deque()
+
+    with _queue_lock:
+        while _job_queue:
+            seq, fut = _job_queue.popleft()
+            if fut.done():
+                exc = fut.exception()
+                if exc:
+                    print(f"[stream] job {seq} failed: {exc}")
+                else:
+                    done.append((seq, fut.result()))
+            else:
+                pending.append((seq, fut))
+
+        # Put unfinished jobs back, sorted by seq
+        for item in sorted(pending, key=lambda x: x[0]):
+            _job_queue.append(item)
+
+    # Sort results by seq so playback order matches speech order
+    done.sort(key=lambda x: x[0])
+    return [r for _, r in done]
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def reset_stream():
-    global _current_target, _last_target, _enroll_buf, _processor
-    _chunker.reset()
-    _processor.reset()
+    global _audio_buf, _last_transcript, _committed_words, _word_buf
+    global _silence_count, _target_lang, _job_seq, _enroll_buf
+    _audio_buf       = np.array([], dtype=np.float32)
+    _last_transcript = ""
+    _committed_words = 0
+    _word_buf        = []
+    _silence_count   = 0
+    _target_lang     = "Hindi"
+    _job_seq         = 0
     _fmt.reset()
-    _current_target = "Hindi"
-    _last_target    = "Hindi"
-    _processor = ParallelChunkProcessor(
-        process_fn=_make_process_fn("Hindi", _speaker_id),
-        max_in_flight=6,
-    )
     with _context_lock:
         _context_window.clear()
     with _enroll_lock:
         _enroll_buf.clear()
+    with _queue_lock:
+        while _job_queue:
+            _, fut = _job_queue.popleft()
+            fut.cancel()
 
 
-def run_pipeline(audio: np.ndarray, sr: int, target_lang: str):
+def run_pipeline(audio_frame: np.ndarray, sr: int, target_lang: str):
     """
-    Called every Gradio streaming frame.
+    Called every Gradio streaming frame (~100ms cadence).
 
     Returns
     -------
     transcript_display, translation_display, speech_file | None, latency_str
     """
-    global _current_target, _last_target, _processor
+    global _audio_buf, _last_transcript, _committed_words
+    global _word_buf, _silence_count, _target_lang
 
-    if audio is None:
+    if audio_frame is None:
         t, tr = _fmt.display()
         return t, tr, None, ""
 
-    _current_target = target_lang
+    _target_lang = target_lang
 
-    # Swap processor when language changes mid-session
-    if target_lang != _last_target:
-        _processor.reset()
-        with _context_lock:
-            _context_window.clear()
-        _processor = ParallelChunkProcessor(
-            process_fn=_make_process_fn(target_lang, _speaker_id),
-            max_in_flight=6,
-        )
-        _last_target = target_lang
+    # ── 1. Ingest audio frame ─────────────────────────────────────────────────
+    frame = _to_float32(audio_frame)
+    if frame.ndim > 1:
+        frame = np.mean(frame, axis=1)
+    frame = np.clip(_resample(frame, sr), -1.0, 1.0)
 
-    t_frame = time.perf_counter()
+    _audio_buf = np.concatenate([_audio_buf, frame])
 
-    # VAD chunk detection
-    chunk = _chunker.push(audio, sr)
-    if chunk is not None:
-        _try_enroll(chunk)
-        _processor._fn = _make_process_fn(target_lang, _speaker_id)
-        _processor.push(chunk, sample_rate=16000)
+    # Keep only the last WINDOW_SECS of audio
+    max_samples = int(WINDOW_SECS * SR)
+    if len(_audio_buf) > max_samples:
+        _audio_buf = _audio_buf[-max_samples:]
 
-    # ── Drain ALL completed chunks (not just front-of-queue) ─────────────────
-    # Using drain_ready() so a slow middle chunk doesn't block faster ones.
-    ready = _processor.drain_ready()
+    # ── 2. Enrollment from mic audio ─────────────────────────────────────────
+    _try_enroll(frame)
 
-    if not ready:
-        t, tr = _fmt.display()
-        return t, tr, None, ""
+    # ── 3. Silence detection (energy-based, very fast) ────────────────────────
+    frame_is_silent = _is_silent(frame)
+    if frame_is_silent:
+        _silence_count += 1
+    else:
+        _silence_count = 0
 
-    # ── Process every drained result — no chunk is skipped ───────────────────
-    last_speech_file = None
-    total_asr  = 0.0
-    total_tr   = 0.0
-    total_tts  = 0.0
-    dubbed_count = 0
+    silence_frames_needed = int(SILENCE_COMMIT / FRAME_HOP)
 
-    for _seq, result in ready:
-        if not result.get("text"):
-            continue
+    # ── 4. Run Whisper on rolling window (every frame) ────────────────────────
+    t_asr = time.perf_counter()
+    if len(_audio_buf) >= int(0.3 * SR):   # need at least 300ms for Whisper
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            sf.write(tmp.name, _audio_buf, SR)
+            wav_path = tmp.name
+        new_transcript, _ = transcribe(wav_path)
+    else:
+        new_transcript = _last_transcript
+    asr_ms = round((time.perf_counter() - t_asr) * 1000, 1)
 
+    # ── 5. Diff: find new words since last commit ─────────────────────────────
+    new_words  = new_transcript.strip().split()
+    prev_words = _last_transcript.strip().split()
+
+    # New words = words beyond what we already had
+    if len(new_words) > len(prev_words):
+        incremental = new_words[len(prev_words):]
+        _word_buf.extend(incremental)
+
+    _last_transcript = new_transcript
+
+    # ── 6. Commit decision ────────────────────────────────────────────────────
+    should_commit = False
+
+    # Condition A: enough new words AND speaker just went quiet
+    if len(_word_buf) >= COMMIT_WORDS and _silence_count >= silence_frames_needed:
+        should_commit = True
+
+    # Condition B: too many words buffered (speaker talking fast, don't wait)
+    if len(_word_buf) >= FORCE_WORDS:
+        should_commit = True
+
+    speech_file = None
+    latency     = ""
+
+    if should_commit and _word_buf:
+        commit_text = " ".join(_word_buf).strip()
+        _word_buf   = []
+
+        # Reset rolling window so next ASR starts fresh after this commit
+        _audio_buf       = np.array([], dtype=np.float32)
+        _last_transcript = ""
+
+        # Submit translate+TTS to background thread (non-blocking)
+        _submit_job(commit_text, target_lang)
+        _fmt.push(commit_text, "…")    # show transcript immediately
+
+    # ── 7. Drain completed background jobs ───────────────────────────────────
+    finished = _drain_jobs()
+    for result in finished:
         _fmt.push(result["text"], result["translated"])
-
-        # Every chunk with audio gets queued — none are dropped
         if result.get("speech_file"):
-            last_speech_file = result["speech_file"]
-            dubbed_count += 1
-
-        total_asr  += result["asr_ms"]
-        total_tr   += result["tr_ms"]
-        total_tts  += result["tts_ms"]
+            speech_file = result["speech_file"]
+        latency = (
+            f"ASR {asr_ms:.0f} ms  |  "
+            f"Translate {result['tr_ms']:.0f} ms  |  "
+            f"TTS {result['tts_ms']:.0f} ms  |  "
+            f"jobs: {len(_job_queue)} queued  |  "
+            f"clone: {'✅' if is_enrolled(SPEAKER_ID) else '⏳'}"
+        )
 
     transcript_display, translation_display = _fmt.display()
-
-    if not last_speech_file:
-        return transcript_display, translation_display, None, ""
-
-    total_ms = round((time.perf_counter() - t_frame) * 1000, 1)
-    cloning  = is_enrolled(_speaker_id)
-    latency  = (
-        f"ASR {total_asr:.0f} ms  |  Translate {total_tr:.0f} ms  |  "
-        f"TTS {total_tts:.0f} ms  |  Total {total_ms} ms  |  "
-        f"dubbed {dubbed_count} chunk(s)  |  "
-        f"pool: {_processor.in_flight} in-flight  |  "
-        f"voice clone: {'✅' if cloning else '⏳ enrolling'}"
-    )
-    return transcript_display, translation_display, last_speech_file, latency
+    return transcript_display, translation_display, speech_file, latency
