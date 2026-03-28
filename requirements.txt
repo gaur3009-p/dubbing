@@ -10,29 +10,23 @@ librosa
 soundfile
 
 # ── Translation ─────────────────────────────────────────────────────────────
-# NLLB local (current)
 sentencepiece
 sacremoses
-
-# Gemini streaming (Phase 2 upgrade — set GEMINI_API_KEY)
 google-generativeai
 
 # ── TTS ─────────────────────────────────────────────────────────────────────
-# Current: Parler TTS (generic)
 parler-tts
-
-# Phase 1 upgrade: CosyVoice zero-shot cloning
-# cosyvoice  # install from: https://github.com/FunAudioLLM/CosyVoice
+git+https://github.com/huggingface/parler-tts.git
 
 # ── Streaming STT ────────────────────────────────────────────────────────────
-# Deepgram Nova-3 (Phase 2 upgrade — set DEEPGRAM_API_KEY)
 websockets
 deepgram-sdk
 
-# ── LiveKit transport (Phase 3 upgrade) ─────────────────────────────────────
-# liveki
-# livekit-agents
+# ── LiveKit real-time transport ──────────────────────────────────────────────
+livekit
+livekit-agents
 
 # ── Utilities ───────────────────────────────────────────────────────────────
 numpy
 httpx
+gradio
