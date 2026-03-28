@@ -1,0 +1,38 @@
+# ── Core inference ──────────────────────────────────────────────────────────
+faster-whisper>=1.0.3
+transformers>=4.40.0
+torch>=2.2.0
+torchaudio>=2.2.0
+
+# ── ASR / VAD ───────────────────────────────────────────────────────────────
+silero-vad>=5.1
+librosa>=0.10.0
+soundfile>=0.12.1
+
+# ── Translation ─────────────────────────────────────────────────────────────
+# NLLB local (current)
+sentencepiece>=0.2.0
+sacremoses>=0.1.1
+
+# Gemini streaming (Phase 2 upgrade — set GEMINI_API_KEY)
+google-generativeai>=0.7.0
+
+# ── TTS ─────────────────────────────────────────────────────────────────────
+# Current: Parler TTS (generic)
+parler-tts>=1.0.0
+
+# Phase 1 upgrade: CosyVoice zero-shot cloning
+# cosyvoice  # install from: https://github.com/FunAudioLLM/CosyVoice
+
+# ── Streaming STT ────────────────────────────────────────────────────────────
+# Deepgram Nova-3 (Phase 2 upgrade — set DEEPGRAM_API_KEY)
+websockets>=12.0
+deepgram-sdk>=3.0.0
+
+# ── LiveKit transport (Phase 3 upgrade) ─────────────────────────────────────
+# livekit>=0.11.0
+# livekit-agents>=0.8.0
+
+# ── Utilities ───────────────────────────────────────────────────────────────
+numpy>=1.26.0
+httpx>=0.27.0
