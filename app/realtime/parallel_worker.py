@@ -1,24 +1,3 @@
-"""
-parallel_worker.py
-==================
-Fix vs original
-───────────────
-drain() previously stopped at the FIRST unfinished chunk even when later
-chunks were already done.  This caused silent gaps: slow chunk N held up
-chunks N+1, N+2 … which then all played back as a burst when N finally
-finished.
-
-New behaviour
-─────────────
-- drain_ready()  → yields every chunk that is done, in order, skipping
-                   any chunk that is still running.  Skipped chunks remain
-                   in the queue and are returned on the next drain call.
-                   This means a slow long-sentence chunk does NOT block
-                   shorter chunks that finished after it.
-
-- drain()        → original blocking behaviour, kept for callers that need
-                   strict ordering (sentence pipeline).
-"""
 from __future__ import annotations
 import tempfile
 import soundfile as sf
@@ -34,7 +13,6 @@ class ParallelChunkProcessor:
     """
     Submit audio chunks for parallel inference; drain completed results.
     """
-
     def __init__(
         self,
         process_fn: Callable[[str], Any],
@@ -45,16 +23,14 @@ class ParallelChunkProcessor:
         self._queue: deque[tuple[int, Future]] = deque()
         self._seq  = 0
 
-    # ── reset ─────────────────────────────────────────────────────────────────
-
+    # ── reset ──────────────────────────────────────────────────────────────
     def reset(self):
         while self._queue:
             _, fut = self._queue.popleft()
             fut.cancel()
         self._seq = 0
 
-    # ── submit ────────────────────────────────────────────────────────────────
-
+    # ── submit ─────────────────────────────────────────────────────────────
     def push(self, audio_chunk, sample_rate: int = 16000) -> None:
         # Back-pressure: wait only if queue is truly full AND front isn't done
         if self._max is not None:
@@ -62,33 +38,25 @@ class ParallelChunkProcessor:
                 if self._queue[0][1].done():
                     break
                 time.sleep(0.005)
-
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             sf.write(tmp.name, audio_chunk, sample_rate)
             path = tmp.name
-
         seq = self._seq
         self._seq += 1
         fut = _POOL.submit(self._fn, path)
         self._queue.append((seq, fut))
 
-    # ── drain (non-blocking, skips slow middle chunks) ────────────────────────
-
+    # ── drain_ready (non-blocking, skips slow middle chunks) ───────────────
     def drain_ready(self) -> list[tuple[int, Any]]:
         """
         Return ALL completed chunks in submission order, skipping any chunk
         that is still running.  Skipped chunks stay in the queue.
-
-        This prevents a slow chunk from blocking faster ones that finished
-        after it — which was the root cause of silent gaps in the dub.
         """
         results   = []
         remaining = deque()
-
         while self._queue:
             seq, fut = self._queue.popleft()
             if not fut.done():
-                # Still running — keep it, but don't stop here
                 remaining.append((seq, fut))
                 continue
             exc = fut.exception()
@@ -96,18 +64,15 @@ class ParallelChunkProcessor:
                 print(f"[ParallelChunkProcessor] chunk {seq} failed: {exc}")
                 continue
             results.append((seq, fut.result()))
-
-        # Put unfinished chunks back in order
         for item in remaining:
             self._queue.appendleft(item)
-        # Re-sort so submission order is preserved in the queue
         self._queue = deque(sorted(self._queue, key=lambda x: x[0]))
-
         return results
 
+    # ── drain (strict-order) ───────────────────────────────────────────────
     def drain(self) -> list[tuple[int, Any]]:
         """
-        Original strict-order drain: stops at the first unfinished chunk.
+        Strict-order drain: stops at the first unfinished chunk.
         Kept for callers that need guaranteed ordering (sentence pipeline).
         """
         results = []
