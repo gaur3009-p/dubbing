@@ -13,6 +13,7 @@ _SENT_END     = re.compile(r'([.!?]["\'»]?)\s+')
 _ARTEFACTS    = re.compile(r"[\[\(][^\]\)]{0,40}[\]\)]|\*[^*]{0,40}\*")
 _LEADING_JUNK = re.compile(r"^[\s,;.!?—–\-]+")
 
+
 def _clean(raw: str) -> str:
     t = raw.strip()
     if not t:
@@ -31,6 +32,7 @@ def _clean(raw: str) -> str:
     if t and t[-1] not in ".!?,;:—":
         t += "."
     return t
+
 
 class TranscriptFormatter:
     MAX_LINE  = 85
@@ -104,6 +106,7 @@ class TranscriptFormatter:
     def _commit_t(self, line: str) -> None:
         if line.strip():
             self._t_lines.append(line.strip())
+
 
 def format_full_text(raw: str) -> str:
     fmt = TranscriptFormatter()
